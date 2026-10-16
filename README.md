@@ -1,5 +1,8 @@
 # TeSTra: Real-time Online Video Detection with Temporal Smoothing Transformers
 
+## Modifications
+This is a fork of [TeSTra](https://github.com/zhaoyue-zephyrus/TeSTra) (Apache-2.0).
+
 ## Introduction
 
 This is a PyTorch implementation for our ECCV 2022 paper "[`Real-time Online Video Detection with Temporal Smoothing Transformers`](https://arxiv.org/pdf/2209.09236.pdf)".
