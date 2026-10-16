@@ -3,6 +3,10 @@
 
 __all__ = ['build_feature_head']
 
+import glob
+import os.path as osp
+
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -19,6 +23,22 @@ FEATURE_SIZES = {
     'flow_kinetics_resnet50': 2048,
     'obj_ek55_fasterrcnn': 352,
 }
+
+
+def get_feature_size(cfg, feature_name: str) -> int:
+    if feature_name in FEATURE_SIZES:
+        return FEATURE_SIZES[feature_name]
+    
+    folder = osp.join(cfg.DATA.DATA_ROOT, feature_name)
+    files = sorted(glob.glob(osp.join(folder, '*.npy')))
+    if not files:
+        raise FileNotFoundError(
+            'Нет ключа {!r} в FEATURE_SIZES и нет .npy в {}'.format(
+                feature_name, folder
+            )
+        )
+    
+    return int(np.load(files[0], mmap_mode='r').shape[-1])
 
 
 @FEATURE_HEADS.register('THUMOS')
@@ -39,20 +59,20 @@ class BaseFeatureHead(nn.Module):
             raise RuntimeError('Unknown modality of {}'.format(cfg.INPUT.MODALITY))
 
         if self.with_visual and self.with_motion and self.with_object:
-            visual_size = FEATURE_SIZES[cfg.INPUT.VISUAL_FEATURE]
-            motion_size = FEATURE_SIZES[cfg.INPUT.MOTION_FEATURE]
-            object_size = FEATURE_SIZES[cfg.INPUT.OBJECT_FEATURE]
+            visual_size = get_feature_size(cfg, cfg.INPUT.VISUAL_FEATURE)
+            motion_size = get_feature_size(cfg, cfg.INPUT.MOTION_FEATURE)
+            object_size = get_feature_size(cfg, cfg.INPUT.OBJECT_FEATURE)
             fusion_size = visual_size + motion_size + object_size
         elif self.with_visual and self.with_motion:
-            visual_size = FEATURE_SIZES[cfg.INPUT.VISUAL_FEATURE]
-            motion_size = FEATURE_SIZES[cfg.INPUT.MOTION_FEATURE]
+            visual_size = get_feature_size(cfg, cfg.INPUT.VISUAL_FEATURE)
+            motion_size = get_feature_size(cfg, cfg.INPUT.MOTION_FEATURE)
             fusion_size = visual_size + motion_size
         elif self.with_visual:
-            fusion_size = FEATURE_SIZES[cfg.INPUT.VISUAL_FEATURE]
+            fusion_size = get_feature_size(cfg, cfg.INPUT.VISUAL_FEATURE)
         elif self.with_motion:
-            fusion_size = FEATURE_SIZES[cfg.INPUT.MOTION_FEATURE]
+            fusion_size = get_feature_size(cfg, cfg.INPUT.MOTION_FEATURE)
         elif self.with_object:
-            fusion_size = FEATURE_SIZES[cfg.INPUT.OBJECT_FEATURE]
+            fusion_size = get_feature_size(cfg, cfg.INPUT.OBJECT_FEATURE)
 
         self.d_model = fusion_size
 

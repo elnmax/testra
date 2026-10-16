@@ -4,6 +4,7 @@
 __all__ = ['setup_checkpointer']
 
 import os.path as osp
+from typing import Optional
 
 import torch
 
@@ -27,16 +28,25 @@ class Checkpointer(object):
             if optimizer is not None:
                 optimizer.load_state_dict(self.checkpoint['optimizer_state_dict'])
 
-    def save(self, epoch, model, optimizer):
-        torch.save({
+    def save(self, epoch, model, optimizer, filename: Optional[str] = None):
+        checkpoint = {
             'epoch': epoch,
             'model_state_dict': model.module.state_dict() if torch.cuda.device_count() > 1 else model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-        }, osp.join(self.output_dir, 'epoch-{}.pth'.format(epoch)))
+        }
+
+        if filename is None:
+            filename = 'epoch-{}.pth'.format(epoch)
+
+        torch.save(checkpoint, osp.join(self.output_dir, filename))
 
     def _load_checkpoint(self, checkpoint):
         if checkpoint is not None and osp.isfile(checkpoint):
-            return torch.load(checkpoint, map_location=torch.device('cpu'))
+            return torch.load(
+                checkpoint,
+                map_location=torch.device('cpu'),
+                weights_only=False,
+            )
         return None
 
 

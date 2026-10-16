@@ -1,6 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import os.path as osp
 from bisect import bisect_right
 import time
@@ -32,6 +33,221 @@ def do_lstr_batch_inference(cfg,
                                         model,
                                         device,
                                         logger)
+
+
+def evaluate_stream_results(cfg, pred_scores_all, gt_targets_all, logger):
+    """Compute global per-frame mAP and EK segment-level metrics for stream inference."""
+    pred_scores = pred_scores_all
+    pred_scores_verb = {}
+    pred_scores_noun = {}
+
+    if cfg.MODEL.LSTR.ANTICIPATION_NUM_SAMPLES > 0:
+        maps_list = []
+        for t_a in range(0, cfg.MODEL.LSTR.ANTICIPATION_NUM_SAMPLES):
+            result = compute_result['perframe'](
+                cfg,
+                np.concatenate(list(gt_targets_all.values()), axis=0),
+                np.concatenate(list(pred_scores_all.values()), axis=0)[:, :, t_a],
+            )
+            logger.info('Action anticipation ({:.2f}s) perframe m{}: {:.5f}'.format(
+                (t_a + 1) / cfg.DATA.FPS * cfg.MODEL.LSTR.ANTICIPATION_SAMPLE_RATE,
+                cfg.DATA.METRICS, result['mean_AP']
+            ))
+            maps_list.append(result['mean_AP'])
+        logger.info('Action anticipation (mean) perframe m{}: {:.5f}'.format(
+            cfg.DATA.METRICS, np.mean(maps_list)
+        ))
+    else:
+        result = compute_result['perframe'](
+            cfg,
+            np.concatenate(list(gt_targets_all.values()), axis=0),
+            np.concatenate(list(pred_scores_all.values()), axis=0),
+        )
+        logger.info('Action detection perframe m{}: {:.5f}'.format(
+            cfg.DATA.METRICS, result['mean_AP']
+        ))
+
+    # segment-level evaluation on EK55/EK100
+    if cfg.DATA.DATA_NAME.startswith('EK'):
+        try:
+            import pandas as pd
+            from external.rulstm.RULSTM.utils import (get_marginal_indexes, marginalize, softmax,
+                                                      topk_accuracy_multiple_timesteps,
+                                                      topk_recall_multiple_timesteps,
+                                                      tta)
+        except:
+            raise ModuleNotFoundError
+        if cfg.DATA.DATA_NAME == 'EK55':
+            path_to_data = 'external/rulstm/RULSTM/data/ek55/'
+        elif cfg.DATA.DATA_NAME == 'EK100':
+            path_to_data = 'external/rulstm/RULSTM/data/ek100/'
+        segment_list = pd.read_csv(osp.join(path_to_data, 'validation.csv'),
+                                   names=['id', 'video', 'start_f', 'end_f', 'verb', 'noun', 'action'],
+                                   skipinitialspace=True)
+        predictions, labels, ids = [], [], []
+        predictions_verb, predictions_noun = [], []
+        discarded_labels, discarded_ids = [], []
+        for segment in segment_list.iterrows():
+            start_step = int(np.floor(segment[1]['start_f'] / 30 * cfg.DATA.FPS))
+            vid = segment[1]['video'].strip()
+            preds = (pred_scores[vid][start_step][None, 1:, ::-1]).transpose(0, 2, 1)
+            if cfg.MODEL.LSTR.V_N_CLASSIFIER:
+                raise NotImplementedError(
+                        'For TeSTra with decomposed classifier (V+N), please use batch mode, ie ``MODEL.LSTR.INFERENCE_MODE batch``'
+                )
+                preds_v = (pred_scores_verb[vid][start_step][None, 1:, ::-1]).transpose(0, 2, 1)
+                preds_n = (pred_scores_noun[vid][start_step][None, 1:, ::-1]).transpose(0, 2, 1)
+            else:
+                preds_v = None
+                preds_n = None
+            if start_step >= cfg.MODEL.LSTR.ANTICIPATION_LENGTH:
+                predictions.append(preds)
+                if preds_v is not None:
+                    predictions_verb.append(preds_v)
+                if preds_n is not None:
+                    predictions_noun.append(preds_n)
+                labels.append(segment[1][['verb', 'noun', 'action']].values.astype(int))
+                ids.append(segment[1]['id'])
+            else:
+                discarded_labels.append(segment[1][['verb', 'noun', 'action']].values.astype(int))
+                discarded_ids.append(segment[1]['id'])
+
+        actions = pd.read_csv(osp.join(path_to_data, 'actions.csv'), index_col='id')
+
+        action_scores = np.concatenate(predictions)
+        if len(predictions_verb) > 0:
+            verb_scores = np.concatenate(predictions_verb)
+        else:
+            verb_scores = None
+        if len(predictions_noun) > 0:
+            noun_scores = np.concatenate(predictions_noun)
+        else:
+            noun_scores = None
+        labels = np.array(labels)
+        ids = np.array(ids)
+
+        vi = get_marginal_indexes(actions, 'verb')
+        ni = get_marginal_indexes(actions, 'noun')
+
+        action_probs = softmax(action_scores.reshape(-1, action_scores.shape[-1]))
+        if verb_scores is None:
+            verb_scores = marginalize(action_probs, vi).reshape(action_scores.shape[0],
+                                                                action_scores.shape[1],
+                                                                -1)
+        else:
+            verb_scores = softmax(verb_scores.reshape(-1, verb_scores.shape[-1]))
+            verb_scores = verb_scores.reshape(action_scores.shape[0],
+                                              action_scores.shape[1],
+                                              -1)
+        if noun_scores is None:
+            noun_scores = marginalize(action_probs, ni).reshape(action_scores.shape[0],
+                                                                action_scores.shape[1],
+                                                                -1)
+        else:
+            noun_scores = softmax(noun_scores.reshape(-1, noun_scores.shape[-1]))
+            noun_scores = noun_scores.reshape(action_scores.shape[0],
+                                              action_scores.shape[1],
+                                              -1)
+
+        include_discarded = (cfg.DATA.DATA_NAME == 'EK100')
+        if include_discarded:
+            dlab = np.array(discarded_labels)
+            dislab = np.array(discarded_ids)
+            ids = np.concatenate([ids, dislab])
+            num_disc = len(dlab)
+            labels = np.concatenate([labels, dlab])
+            verb_scores = np.concatenate((verb_scores, np.zeros((num_disc, *verb_scores.shape[1:]))))
+            noun_scores = np.concatenate((noun_scores, np.zeros((num_disc, *noun_scores.shape[1:]))))
+            action_scores = np.concatenate((action_scores, np.zeros((num_disc, *action_scores.shape[1:]))))
+
+        verb_labels, noun_labels, action_labels = labels[:, 0], labels[:, 1], labels[:, 2]
+        verb_accuracies = topk_accuracy_multiple_timesteps(verb_scores, verb_labels)
+        noun_accuracies = topk_accuracy_multiple_timesteps(noun_scores, noun_labels)
+        action_accuracies = topk_accuracy_multiple_timesteps(action_scores, action_labels)
+
+        if cfg.DATA.DATA_NAME == 'EK55':
+            many_shot_verbs = pd.read_csv(osp.join(path_to_data, 'EPIC_many_shot_verbs.csv'))['verb_class'].values
+            many_shot_nouns = pd.read_csv(osp.join(path_to_data, 'EPIC_many_shot_nouns.csv'))['noun_class'].values
+            actions = pd.read_csv(osp.join(path_to_data, 'actions.csv'))
+            a_to_vn = {a[1]['id']: tuple(a[1][['verb', 'noun']].values)
+                    for a in actions.iterrows()}
+            many_shot_actions = [a for a, (v, n) in a_to_vn.items()
+                                if v in many_shot_verbs or n in many_shot_nouns]
+
+            verb_recalls = topk_recall_multiple_timesteps(verb_scores, verb_labels,
+                                                        k=5, classes=many_shot_verbs)
+            noun_recalls = topk_recall_multiple_timesteps(noun_scores, noun_labels,
+                                                        k=5, classes=many_shot_nouns)
+            action_recalls = topk_recall_multiple_timesteps(action_scores, action_labels,
+                                                            k=5, classes=many_shot_actions)
+
+            all_accuracies = np.concatenate([verb_accuracies, noun_accuracies, action_accuracies,
+                                            verb_recalls, noun_recalls, action_recalls])
+            all_accuracies = all_accuracies[[0, 1, 6, 2, 3, 7, 4, 5, 8]]
+            indices = [
+                ('Verb', 'Top-1 Accuracy'), ('Verb', 'Top-5 Accuracy'),
+                ('Verb', 'Mean Top-5 Recall'),
+                ('Noun', 'Top-1 Accuracy'), ('Noun', 'Top-5 Accuracy'),
+                ('Noun', 'Mean Top-5 Recall'),
+                ('Action', 'Top-1 Accuracy'), ('Action', 'Top-5 Accuracy'),
+                ('Action', 'Mean Top-5 Recall'),
+            ]
+        else:
+            overall_verb_recalls = topk_recall_multiple_timesteps(verb_scores, verb_labels, k=5)
+            overall_noun_recalls = topk_recall_multiple_timesteps(noun_scores, noun_labels, k=5)
+            overall_action_recalls = topk_recall_multiple_timesteps(action_scores, action_labels, k=5)
+
+            unseen = pd.read_csv(osp.join(path_to_data, 'validation_unseen_participants_ids.csv'), names=['id'], squeeze=True)
+            tail_verbs = pd.read_csv(osp.join(path_to_data, 'validation_tail_verbs_ids.csv'), names=['id'], squeeze=True)
+            tail_nouns = pd.read_csv(osp.join(path_to_data, 'validation_tail_nouns_ids.csv'), names=['id'], squeeze=True)
+            tail_actions = pd.read_csv(osp.join(path_to_data, 'validation_tail_actions_ids.csv'), names=['id'], squeeze=True)
+
+            unseen_bool_idx = pd.Series(ids).isin(unseen).values
+            tail_verbs_bool_idx = pd.Series(ids).isin(tail_verbs).values
+            tail_nouns_bool_idx = pd.Series(ids).isin(tail_nouns).values
+            tail_actions_bool_idx = pd.Series(ids).isin(tail_actions).values
+
+            tail_verb_recalls = topk_recall_multiple_timesteps(
+                verb_scores[tail_verbs_bool_idx], verb_labels[tail_verbs_bool_idx], k=5)
+            tail_noun_recalls = topk_recall_multiple_timesteps(
+                noun_scores[tail_nouns_bool_idx], noun_labels[tail_nouns_bool_idx], k=5)
+            tail_action_recalls = topk_recall_multiple_timesteps(
+                action_scores[tail_actions_bool_idx], action_labels[tail_actions_bool_idx], k=5)
+
+            unseen_verb_recalls = topk_recall_multiple_timesteps(
+                verb_scores[unseen_bool_idx], verb_labels[unseen_bool_idx], k=5)
+            unseen_noun_recalls = topk_recall_multiple_timesteps(
+                noun_scores[unseen_bool_idx], noun_labels[unseen_bool_idx], k=5)
+            unseen_action_recalls = topk_recall_multiple_timesteps(
+                action_scores[unseen_bool_idx], action_labels[unseen_bool_idx], k=5)
+
+            all_accuracies = np.concatenate(
+                [overall_verb_recalls, overall_noun_recalls, overall_action_recalls,
+                 unseen_verb_recalls, unseen_noun_recalls, unseen_action_recalls,
+                 tail_verb_recalls, tail_noun_recalls, tail_action_recalls]
+            ) #9 x 8
+
+            indices = [
+                ('Overall Mean Top-5 Recall', 'Verb'), ('Overall Mean Top-5 Recall', 'Noun'),
+                ('Overall Mean Top-5 Recall', 'Action'),
+                ('Unseen Mean Top-5 Recall', 'Verb'), ('Unseen Mean Top-5 Recall', 'Noun'),
+                ('Unseen Mean Top-5 Recall', 'Action'),
+                ('Tail Mean Top-5 Recall', 'Verb'), ('Tail Mean Top-5 Recall', 'Noun'),
+                ('Tail Mean Top-5 Recall', 'Action'),
+            ]
+
+        cc = np.linspace(1 / cfg.DATA.FPS * cfg.MODEL.LSTR.ANTICIPATION_LENGTH,
+                        1 / cfg.DATA.FPS * cfg.MODEL.LSTR.ANTICIPATION_SAMPLE_RATE,
+                        cfg.MODEL.LSTR.ANTICIPATION_NUM_SAMPLES, dtype=str)
+        scores = pd.DataFrame(all_accuracies * 100, columns=cc,
+                            index=pd.MultiIndex.from_tuples(indices))
+        logger.info(scores)
+
+        tta_verb = tta(verb_scores, verb_labels)
+        tta_noun = tta(noun_scores, noun_labels)
+        tta_action = tta(action_scores, action_labels)
+        logger.info(f'\nMean TtA(5): VERB {tta_verb:0.2f} '
+                    f'NOUN: {tta_noun:0.2f} ACTION: {tta_action:0.2f}')
 
 
 def do_lstr_stream_inference(cfg, model, device, logger):
@@ -68,10 +284,33 @@ def do_lstr_stream_inference(cfg, model, device, logger):
                 pred_scores = []
             gt_targets = []
 
-            visual_inputs = np.load(osp.join(cfg.DATA.DATA_ROOT, cfg.INPUT.VISUAL_FEATURE, session + '.npy'), mmap_mode='r')
-            motion_inputs = np.load(osp.join(cfg.DATA.DATA_ROOT, cfg.INPUT.MOTION_FEATURE, session + '.npy'), mmap_mode='r')
-            object_inputs = np.load(osp.join(cfg.DATA.DATA_ROOT, cfg.INPUT.OBJECT_FEATURE, session + '.npy'), mmap_mode='r')
+            modality = cfg.INPUT.MODALITY
+            _use_visual = 'visual' in modality
+            _use_motion = 'motion' in modality
+            _use_object = 'object' in modality
+
+            visual_inputs = np.load(osp.join(cfg.DATA.DATA_ROOT, cfg.INPUT.VISUAL_FEATURE, session + '.npy'), mmap_mode='r') if _use_visual else None
+            motion_inputs = np.load(osp.join(cfg.DATA.DATA_ROOT, cfg.INPUT.MOTION_FEATURE, session + '.npy'), mmap_mode='r') if _use_motion else None
+            object_inputs = np.load(osp.join(cfg.DATA.DATA_ROOT, cfg.INPUT.OBJECT_FEATURE, session + '.npy'), mmap_mode='r') if _use_object else None
             target = np.load(osp.join(cfg.DATA.DATA_ROOT, cfg.INPUT.TARGET_PERFRAME, session + '.npy'))
+
+            _loaded = [a for a in (visual_inputs, motion_inputs, object_inputs) if a is not None]
+            num_frames = min(target.shape[0], *(a.shape[0] for a in _loaded))
+            target = target[:num_frames]
+            if visual_inputs is not None:
+                visual_inputs = visual_inputs[:num_frames]
+            if motion_inputs is not None:
+                motion_inputs = motion_inputs[:num_frames]
+            if object_inputs is not None:
+                object_inputs = object_inputs[:num_frames]
+
+            _stub = _loaded[0][:num_frames]
+            if visual_inputs is None:
+                visual_inputs = _stub
+            if motion_inputs is None:
+                motion_inputs = _stub
+            if object_inputs is None:
+                object_inputs = _stub
 
             start_time = time.time()
 
@@ -197,221 +436,14 @@ def do_lstr_stream_inference(cfg, model, device, logger):
                 pred_scores_all[session] = np.array(pred_scores)
 
 
-    # pkl.dump({
-    #     'cfg': cfg,
-    #     'perframe_pred_scores': pred_scores_all,
-    #     'perframe_gt_targets': gt_targets_all,
-    # }, open(osp.splitext(cfg.MODEL.CHECKPOINT)[0] + '.stream.pkl', 'wb'))
+    stream_pkl = os.environ.get('TESTRA_STREAM_PKL')
+    if stream_pkl:
+        with open(stream_pkl, 'wb') as f:
+            pkl.dump({
+                'cfg': cfg,
+                'perframe_pred_scores': pred_scores_all,
+                'perframe_gt_targets': gt_targets_all,
+            }, f)
 
-    if cfg.MODEL.LSTR.ANTICIPATION_NUM_SAMPLES > 0:
-        maps_list = []
-        for t_a in range(0, cfg.MODEL.LSTR.ANTICIPATION_NUM_SAMPLES):
-            result = compute_result['perframe'](
-                cfg,
-                np.concatenate(list(gt_targets_all.values()), axis=0),
-                np.concatenate(list(pred_scores_all.values()), axis=0)[:, :, t_a],
-            )
-            logger.info('Action anticipation ({:.2f}s) perframe m{}: {:.5f}'.format(
-                (t_a + 1) / cfg.DATA.FPS * cfg.MODEL.LSTR.ANTICIPATION_SAMPLE_RATE,
-                cfg.DATA.METRICS, result['mean_AP']
-            ))
-            maps_list.append(result['mean_AP'])
-        logger.info('Action anticipation (mean) perframe m{}: {:.5f}'.format(
-            cfg.DATA.METRICS, np.mean(maps_list)
-        ))
-    else:
-        result = compute_result['perframe'](
-            cfg,
-            np.concatenate(list(gt_targets_all.values()), axis=0),
-            np.concatenate(list(pred_scores_all.values()), axis=0),
-        )
-        logger.info('Action detection perframe m{}: {:.5f}'.format(
-            cfg.DATA.METRICS, result['mean_AP']
-        ))
-
-    gt_targets = gt_targets_all
-    pred_scores = pred_scores_all
-    pred_scores_verb = {}
-    pred_scores_noun = {}
-
-    # segment-level evaluation on EK55/EK100
-    if cfg.DATA.DATA_NAME.startswith('EK'):
-        try:
-            import pandas as pd
-            from external.rulstm.RULSTM.utils import (get_marginal_indexes, marginalize, softmax,
-                                                      topk_accuracy_multiple_timesteps,
-                                                      topk_recall_multiple_timesteps,
-                                                      tta)
-        except:
-            raise ModuleNotFoundError
-        if cfg.DATA.DATA_NAME == 'EK55':
-            path_to_data = 'external/rulstm/RULSTM/data/ek55/'
-        elif cfg.DATA.DATA_NAME == 'EK100':
-            path_to_data = 'external/rulstm/RULSTM/data/ek100/'
-        segment_list = pd.read_csv(osp.join(path_to_data, 'validation.csv'),
-                                   names=['id', 'video', 'start_f', 'end_f', 'verb', 'noun', 'action'],
-                                   skipinitialspace=True)
-        predictions, labels, ids = [], [], []
-        predictions_verb, predictions_noun = [], []
-        discarded_labels, discarded_ids = [], []
-        for segment in segment_list.iterrows():
-            start_step = int(np.floor(segment[1]['start_f'] / 30 * cfg.DATA.FPS))
-            vid = segment[1]['video'].strip()
-            preds = (pred_scores[vid][start_step][None, 1:, ::-1]).transpose(0, 2, 1)
-            if cfg.MODEL.LSTR.V_N_CLASSIFIER:
-                raise NotImplementedError(
-                        'For TeSTra with decomposed classifier (V+N), please use batch mode, ie ``MODEL.LSTR.INFERENCE_MODE batch``'
-                )
-                preds_v = (pred_scores_verb[vid][start_step][None, 1:, ::-1]).transpose(0, 2, 1)
-                preds_n = (pred_scores_noun[vid][start_step][None, 1:, ::-1]).transpose(0, 2, 1)
-            else:
-                preds_v = None
-                preds_n = None
-            if start_step >= cfg.MODEL.LSTR.ANTICIPATION_LENGTH:
-                predictions.append(preds)
-                if preds_v is not None:
-                    predictions_verb.append(preds_v)
-                if preds_n is not None:
-                    predictions_noun.append(preds_n)
-                labels.append(segment[1][['verb', 'noun', 'action']].values.astype(int))
-                ids.append(segment[1]['id'])
-            else:
-                discarded_labels.append(segment[1][['verb', 'noun', 'action']].values.astype(int))
-                discarded_ids.append(segment[1]['id'])
-        
-        actions = pd.read_csv(osp.join(path_to_data, 'actions.csv'), index_col='id')
-
-        action_scores = np.concatenate(predictions)
-        if len(predictions_verb) > 0:
-            verb_scores = np.concatenate(predictions_verb)
-        else:
-            verb_scores = None
-        if len(predictions_noun) > 0:
-            noun_scores = np.concatenate(predictions_noun)
-        else:
-            noun_scores = None
-        labels = np.array(labels)
-        ids = np.array(ids)
-
-        vi = get_marginal_indexes(actions, 'verb')
-        ni = get_marginal_indexes(actions, 'noun')
-
-        action_probs = softmax(action_scores.reshape(-1, action_scores.shape[-1]))
-        if verb_scores is None:
-            verb_scores = marginalize(action_probs, vi).reshape(action_scores.shape[0],
-                                                                action_scores.shape[1],
-                                                                -1)
-        else:
-            verb_scores = softmax(verb_scores.reshape(-1, verb_scores.shape[-1]))
-            verb_scores = verb_scores.reshape(action_scores.shape[0],
-                                              action_scores.shape[1],
-                                              -1)
-        if noun_scores is None:
-            noun_scores = marginalize(action_probs, ni).reshape(action_scores.shape[0],
-                                                                action_scores.shape[1],
-                                                                -1)
-        else:
-            noun_scores = softmax(noun_scores.reshape(-1, noun_scores.shape[-1]))
-            noun_scores = noun_scores.reshape(action_scores.shape[0],
-                                              action_scores.shape[1],
-                                              -1)
-
-        include_discarded = (cfg.DATA.DATA_NAME == 'EK100')
-        if include_discarded:
-            dlab = np.array(discarded_labels)
-            dislab = np.array(discarded_ids)
-            ids = np.concatenate([ids, dislab])
-            num_disc = len(dlab)
-            labels = np.concatenate([labels, dlab])
-            verb_scores = np.concatenate((verb_scores, np.zeros((num_disc, *verb_scores.shape[1:]))))
-            noun_scores = np.concatenate((noun_scores, np.zeros((num_disc, *noun_scores.shape[1:]))))
-            action_scores = np.concatenate((action_scores, np.zeros((num_disc, *action_scores.shape[1:]))))
-
-        verb_labels, noun_labels, action_labels = labels[:, 0], labels[:, 1], labels[:, 2]
-        verb_accuracies = topk_accuracy_multiple_timesteps(verb_scores, verb_labels)
-        noun_accuracies = topk_accuracy_multiple_timesteps(noun_scores, noun_labels)
-        action_accuracies = topk_accuracy_multiple_timesteps(action_scores, action_labels)
-
-        if cfg.DATA.DATA_NAME == 'EK55':
-            many_shot_verbs = pd.read_csv(osp.join(path_to_data, 'EPIC_many_shot_verbs.csv'))['verb_class'].values
-            many_shot_nouns = pd.read_csv(osp.join(path_to_data, 'EPIC_many_shot_nouns.csv'))['noun_class'].values
-            actions = pd.read_csv(osp.join(path_to_data, 'actions.csv'))
-            a_to_vn = {a[1]['id']: tuple(a[1][['verb', 'noun']].values)
-                    for a in actions.iterrows()}
-            many_shot_actions = [a for a, (v, n) in a_to_vn.items()
-                                if v in many_shot_verbs or n in many_shot_nouns]
-            
-            verb_recalls = topk_recall_multiple_timesteps(verb_scores, verb_labels,
-                                                        k=5, classes=many_shot_verbs)
-            noun_recalls = topk_recall_multiple_timesteps(noun_scores, noun_labels,
-                                                        k=5, classes=many_shot_nouns)
-            action_recalls = topk_recall_multiple_timesteps(action_scores, action_labels,
-                                                            k=5, classes=many_shot_actions)
-            
-            all_accuracies = np.concatenate([verb_accuracies, noun_accuracies, action_accuracies,
-                                            verb_recalls, noun_recalls, action_recalls])
-            all_accuracies = all_accuracies[[0, 1, 6, 2, 3, 7, 4, 5, 8]]
-            indices = [
-                ('Verb', 'Top-1 Accuracy'), ('Verb', 'Top-5 Accuracy'),
-                ('Verb', 'Mean Top-5 Recall'),
-                ('Noun', 'Top-1 Accuracy'), ('Noun', 'Top-5 Accuracy'),
-                ('Noun', 'Mean Top-5 Recall'),
-                ('Action', 'Top-1 Accuracy'), ('Action', 'Top-5 Accuracy'),
-                ('Action', 'Mean Top-5 Recall'),
-            ]
-        else:
-            overall_verb_recalls = topk_recall_multiple_timesteps(verb_scores, verb_labels, k=5)
-            overall_noun_recalls = topk_recall_multiple_timesteps(noun_scores, noun_labels, k=5)
-            overall_action_recalls = topk_recall_multiple_timesteps(action_scores, action_labels, k=5)
-
-            unseen = pd.read_csv(osp.join(path_to_data, 'validation_unseen_participants_ids.csv'), names=['id'], squeeze=True)
-            tail_verbs = pd.read_csv(osp.join(path_to_data, 'validation_tail_verbs_ids.csv'), names=['id'], squeeze=True)
-            tail_nouns = pd.read_csv(osp.join(path_to_data, 'validation_tail_nouns_ids.csv'), names=['id'], squeeze=True)
-            tail_actions = pd.read_csv(osp.join(path_to_data, 'validation_tail_actions_ids.csv'), names=['id'], squeeze=True)
-
-            unseen_bool_idx = pd.Series(ids).isin(unseen).values
-            tail_verbs_bool_idx = pd.Series(ids).isin(tail_verbs).values
-            tail_nouns_bool_idx = pd.Series(ids).isin(tail_nouns).values
-            tail_actions_bool_idx = pd.Series(ids).isin(tail_actions).values
-
-            tail_verb_recalls = topk_recall_multiple_timesteps(
-                verb_scores[tail_verbs_bool_idx], verb_labels[tail_verbs_bool_idx], k=5)
-            tail_noun_recalls = topk_recall_multiple_timesteps(
-                noun_scores[tail_nouns_bool_idx], noun_labels[tail_nouns_bool_idx], k=5)
-            tail_action_recalls = topk_recall_multiple_timesteps(
-                action_scores[tail_actions_bool_idx], action_labels[tail_actions_bool_idx], k=5)
-            
-            unseen_verb_recalls = topk_recall_multiple_timesteps(
-                verb_scores[unseen_bool_idx], verb_labels[unseen_bool_idx], k=5)
-            unseen_noun_recalls = topk_recall_multiple_timesteps(
-                noun_scores[unseen_bool_idx], noun_labels[unseen_bool_idx], k=5)
-            unseen_action_recalls = topk_recall_multiple_timesteps(
-                action_scores[unseen_bool_idx], action_labels[unseen_bool_idx], k=5)
-
-            all_accuracies = np.concatenate(
-                [overall_verb_recalls, overall_noun_recalls, overall_action_recalls,
-                 unseen_verb_recalls, unseen_noun_recalls, unseen_action_recalls,
-                 tail_verb_recalls, tail_noun_recalls, tail_action_recalls]
-            ) #9 x 8
-
-            indices = [
-                ('Overall Mean Top-5 Recall', 'Verb'), ('Overall Mean Top-5 Recall', 'Noun'),
-                ('Overall Mean Top-5 Recall', 'Action'),
-                ('Unseen Mean Top-5 Recall', 'Verb'), ('Unseen Mean Top-5 Recall', 'Noun'),
-                ('Unseen Mean Top-5 Recall', 'Action'),
-                ('Tail Mean Top-5 Recall', 'Verb'), ('Tail Mean Top-5 Recall', 'Noun'),
-                ('Tail Mean Top-5 Recall', 'Action'),
-            ]
-
-        cc = np.linspace(1 / cfg.DATA.FPS * cfg.MODEL.LSTR.ANTICIPATION_LENGTH,
-                        1 / cfg.DATA.FPS * cfg.MODEL.LSTR.ANTICIPATION_SAMPLE_RATE,
-                        cfg.MODEL.LSTR.ANTICIPATION_NUM_SAMPLES, dtype=str)
-        scores = pd.DataFrame(all_accuracies * 100, columns=cc,
-                            index=pd.MultiIndex.from_tuples(indices))
-        logger.info(scores)
-
-        tta_verb = tta(verb_scores, verb_labels)
-        tta_noun = tta(noun_scores, noun_labels)
-        tta_action = tta(action_scores, action_labels)
-        logger.info(f'\nMean TtA(5): VERB {tta_verb:0.2f} '
-                    f'NOUN: {tta_noun:0.2f} ACTION: {tta_action:0.2f}')
+    if not os.environ.get('TESTRA_SKIP_GLOBAL_EVAL'):
+        evaluate_stream_results(cfg, pred_scores_all, gt_targets_all, logger)

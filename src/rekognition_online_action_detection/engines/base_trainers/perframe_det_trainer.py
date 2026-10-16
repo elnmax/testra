@@ -23,6 +23,9 @@ def do_perframe_det_train(cfg,
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
 
+    best_metric = float('-inf')
+    best_epoch = 0
+
     for epoch in range(cfg.SOLVER.START_EPOCH, cfg.SOLVER.START_EPOCH + cfg.SOLVER.NUM_EPOCHS):
         # Reset
         det_losses = {phase: 0.0 for phase in cfg.SOLVER.PHASES}
@@ -31,6 +34,7 @@ def do_perframe_det_train(cfg,
         noun_losses = {phase: 0.0 for phase in cfg.SOLVER.PHASES}
         det_pred_scores = []
         det_gt_targets = []
+        det_map = None
 
         start = time.time()
         for phase in cfg.SOLVER.PHASES:
@@ -137,9 +141,10 @@ def do_perframe_det_train(cfg,
                 det_gt_targets,
                 det_pred_scores,
             )
+            det_map = det_result['mean_AP']
             log.append('test det_loss: {:.5f} det_mAP: {:.5f}'.format(
                 det_losses['test'] / len(data_loaders['test'].dataset),
-                det_result['mean_AP'],
+                det_map,
             ))
             if cfg.MODEL.LSTR.V_N_CLASSIFIER:
                 log.append('test verb_loss: {:.5f}'.format(
@@ -154,8 +159,20 @@ def do_perframe_det_train(cfg,
         logger.info(' | '.join(log))
 
         # Save checkpoint for model and optimizer
-        if epoch % cfg.SOLVER.SAVE_EVERY == 0:
+        if cfg.SOLVER.SAVE_BEST_AND_LAST:
+            checkpointer.save(epoch, model, optimizer, filename='last.pth')
+            if 'test' in cfg.SOLVER.PHASES and det_map > best_metric:
+                best_metric = det_map
+                best_epoch = epoch
+                checkpointer.save(epoch, model, optimizer, filename='best.pth')
+        elif epoch % cfg.SOLVER.SAVE_EVERY == 0:
             checkpointer.save(epoch, model, optimizer)
 
         # Shuffle dataset for next epoch
         data_loaders['train'].dataset.shuffle()
+
+    if cfg.SOLVER.SAVE_BEST_AND_LAST and best_metric > float('-inf'):
+        logger.info('Best checkpoint: epoch={} det_mAP={:.5f}'.format(
+            best_epoch,
+            float(best_metric),
+        ))
