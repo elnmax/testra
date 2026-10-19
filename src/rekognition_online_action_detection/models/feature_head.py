@@ -34,7 +34,7 @@ def get_feature_size(cfg, feature_name: str) -> int:
     files = sorted(glob.glob(osp.join(folder, '*.npy')))
     if not files:
         raise FileNotFoundError(
-            'Нет ключа {!r} в FEATURE_SIZES и нет .npy в {}'.format(
+            'No key {!r} in FEATURE_SIZES and no .npy files in {}'.format(
                 feature_name, folder
             )
         )

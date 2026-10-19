@@ -1,10 +1,6 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Оптимизированный stream inference с поддержкой одной и нескольких GPU."""
-
-from __future__ import annotations
-
 import json
 import logging
 import os
@@ -17,6 +13,7 @@ import sys
 import tempfile
 import time
 from bisect import bisect_right
+from datetime import datetime
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -448,8 +445,8 @@ def save_logits_enabled() -> bool:
     return os.environ.get(ENV_SAVE_LOGITS, '').lower() in ('1', 'true', 'yes')
 
 
-# Порядок классов в logits SagVVit (``labels_list.csv``), не совпадает с TeSTra.
-SAGVVIT_CLASS_ORDERS: Dict[str, List[str]] = {
+# Exported logits class order (``labels_list.csv`` style); may differ from TeSTra config.
+CLASS_ORDERS: Dict[str, List[str]] = {
     'TVSeries': [
         'Answer phone', 'Clap', 'Close door', 'Dress up', 'Drink', 'Drive car',
         'Eat', 'Fall/trip', 'Fire weapon', 'Get in/out of car', 'Give something',
@@ -462,29 +459,29 @@ SAGVVIT_CLASS_ORDERS: Dict[str, List[str]] = {
 
 
 def normalize_class_name(name: str) -> str:
-    """Normalize class label for matching TeSTra and SagVVit names."""
+    """Normalize class label for matching across source and target class lists."""
     return name.strip().lower()
 
 
-def build_sagvvit_column_perm(
-    testra_class_names: Sequence[str],
-    sagvvit_class_names: Sequence[str],
+def build_class_column_permutation(
+    source_class_names: Sequence[str],
+    target_class_names: Sequence[str],
 ) -> List[int]:
-    """Build column index perm: SagVVit column ``j`` reads TeSTra column ``perm[j]``."""
-    testra_by_norm = {
+    """Build column index perm: target column ``j`` reads source column ``perm[j]``."""
+    source_by_norm = {
         normalize_class_name(name): idx
-        for idx, name in enumerate(testra_class_names)
+        for idx, name in enumerate(source_class_names)
     }
     perm: List[int] = []
-    for sag_name in sagvvit_class_names:
-        key = normalize_class_name(sag_name)
-        if key not in testra_by_norm:
+    for target_name in target_class_names:
+        key = normalize_class_name(target_name)
+        if key not in source_by_norm:
             raise ValueError(
-                'Class {!r} from SagVVit order is missing in TeSTra CLASS_NAMES'.format(
-                    sag_name,
+                'Class {!r} from configured class order is missing in CLASS_NAMES'.format(
+                    target_name,
                 ),
             )
-        perm.append(testra_by_norm[key])
+        perm.append(source_by_norm[key])
     return perm
 
 
@@ -492,31 +489,31 @@ def reorder_logits_classes(
     logits: np.ndarray,
     perm: Sequence[int],
 ) -> np.ndarray:
-    """Reorder class axis of per-frame logits to SagVVit ``labels_list`` order."""
+    """Reorder class axis of per-frame logits to configured class order."""
     if logits.ndim == 2:
         return logits[:, perm]
     if logits.ndim == 3:
         return logits[:, perm, :]
     raise ValueError(
-        'Unsupported logits shape for SagVVit export: {}'.format(logits.shape),
+        'Unsupported logits shape for ordered logits export: {}'.format(logits.shape),
     )
 
 
-def pack_logits_sagvvit(
+def pack_logits_by_class_order(
     pred_logits_all: Dict[str, np.ndarray],
     sessions: Sequence[str],
-    testra_class_names: Sequence[str],
+    source_class_names: Sequence[str],
     data_name: str,
 ) -> List[np.ndarray]:
-    """Convert session dict with TeSTra class order to SagVVit ``list`` format."""
-    sagvvit_order = SAGVVIT_CLASS_ORDERS.get(data_name)
-    if sagvvit_order is None:
+    """Convert session dict with model class order to ordered list format."""
+    target_class_order = CLASS_ORDERS.get(data_name)
+    if target_class_order is None:
         raise ValueError(
-            'SagVVit logits export is not configured for DATA_NAME={!r}'.format(
+            'Ordered logits export is not configured for DATA_NAME={!r}'.format(
                 data_name,
             ),
         )
-    perm = build_sagvvit_column_perm(testra_class_names, sagvvit_order)
+    perm = build_class_column_permutation(source_class_names, target_class_order)
     sessions_ordered = sorted(sessions)
     missing = [session for session in sessions_ordered if session not in pred_logits_all]
     if missing:
@@ -527,13 +524,13 @@ def pack_logits_sagvvit(
     ]
 
 
-def save_sagvvit_logits_file(
+def save_ordered_logits_file(
     path: str,
     pred_logits_all: Dict[str, np.ndarray],
     cfg,
 ) -> None:
-    """Save logits as ``list[np.ndarray]`` in SagVVit stream OAD format."""
-    logits_list = pack_logits_sagvvit(
+    """Save logits as ``list[np.ndarray]`` with configured class order."""
+    logits_list = pack_logits_by_class_order(
         pred_logits_all,
         cfg.DATA.TEST_SESSION_SET,
         cfg.DATA.CLASS_NAMES,
@@ -546,7 +543,7 @@ def logits_output_path(
     checkpoint_path: str,
     shard_idx: Optional[int] = None,
 ) -> str:
-    """Return output path for SagVVit-compatible ``logits_stream_task-oad.pth``."""
+    """Return output path for ``logits_stream_task-oad.pth`` export."""
     override = os.environ.get(ENV_LOGITS_PATH)
     if override:
         return override
@@ -887,7 +884,7 @@ def do_lstr_stream_inference_optim(cfg, model, device, logger) -> None:
     if pred_logits_all is not None:
         logits_path = logits_output_path(cfg.MODEL.CHECKPOINT)
         if os.environ.get(ENV_LOGITS_PATH):
-            # Промежуточный shard для multi-GPU merge — dict в порядке TeSTra.
+            # Intermediate shard for multi-GPU merge: dict in model class order.
             torch.save(pred_logits_all, logits_path)
             logger.info(
                 'Saved raw logits shard for {} sessions to {}'.format(
@@ -895,9 +892,9 @@ def do_lstr_stream_inference_optim(cfg, model, device, logger) -> None:
                 ),
             )
         else:
-            save_sagvvit_logits_file(logits_path, pred_logits_all, cfg)
+            save_ordered_logits_file(logits_path, pred_logits_all, cfg)
             logger.info(
-                'Saved SagVVit-format logits for {} sessions to {}'.format(
+                'Saved ordered logits for {} sessions to {}'.format(
                     len(pred_logits_all), logits_path,
                 ),
             )
@@ -912,9 +909,13 @@ def do_lstr_stream_inference_optim(cfg, model, device, logger) -> None:
         )
 
 
-def optim_log_path(checkpoint_path: str) -> str:
-    """Return the canonical log path for test_net_optim runs."""
-    return osp.splitext(checkpoint_path)[0] + '.optim.txt'
+def optim_log_path(checkpoint_path: str, data_name: str) -> str:
+    """Return a timestamped log path in the checkpoint results directory."""
+    results_dir = osp.join(osp.dirname(checkpoint_path), 'results')
+    os.makedirs(results_dir, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    filename = '{}_{}.optim.txt'.format(data_name, timestamp)
+    return osp.join(results_dir, filename)
 
 
 def setup_optim_logger(
@@ -923,7 +924,7 @@ def setup_optim_logger(
     quiet: bool = False,
     write_file: bool = True,
 ) -> logging.Logger:
-    """Create logger for test_net_optim; file output uses {checkpoint}.optim.txt."""
+    """Create logger for test_net_optim with timestamped results output."""
     logger = logging.getLogger('rekognition.test_net_optim')
     level = logging.DEBUG if cfg.VERBOSE else logging.INFO
     logger.setLevel(level)
@@ -934,7 +935,10 @@ def setup_optim_logger(
         logger.addHandler(stream_handler)
 
         if write_file:
-            log_file = optim_log_path(cfg.MODEL.CHECKPOINT)
+            log_file = optim_log_path(
+                cfg.MODEL.CHECKPOINT,
+                cfg.DATA.DATA_NAME,
+            )
             file_handler = logging.FileHandler(log_file)
             file_handler.setLevel(logging.INFO)
             logger.addHandler(file_handler)
@@ -1120,9 +1124,9 @@ def run_launcher(cfg, args) -> None:
         if save_logits:
             logits_all = merge_shard_logits(shard_logits, sessions)
             merged_logits_path = logits_output_path(cfg.MODEL.CHECKPOINT)
-            save_sagvvit_logits_file(merged_logits_path, logits_all, cfg)
+            save_ordered_logits_file(merged_logits_path, logits_all, cfg)
             logger.info(
-                'Saved merged SagVVit-format logits for {} sessions to {}'.format(
+                'Saved merged ordered logits for {} sessions to {}'.format(
                     len(logits_all), merged_logits_path,
                 ),
             )

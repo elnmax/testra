@@ -29,7 +29,7 @@ def setup_random_seed(seed):
 
 
 def seed_worker(worker_id: int) -> None:
-    """Инициализировать seed NumPy и random внутри DataLoader worker."""
+    """Initialize NumPy and random seeds inside a DataLoader worker."""
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
@@ -40,21 +40,21 @@ def setup_deterministic_training(
     seed_data: int,
 ) -> Tuple[torch.Generator, Callable[[int], None]]:
     """
-    Настройка детерминированного обучения.
+    Configure deterministic training.
 
     https://docs.pytorch.org/docs/stable/notes/randomness.html
 
     Parameters
     ----------
     seed_model : int
-        Seed для модели и глобальных генераторов.
+        Seed for the model and global RNGs.
     seed_data : int
-        Seed для DataLoader generator.
+        Seed for the DataLoader generator.
 
     Returns
     -------
     tuple[torch.Generator, Callable[[int], None]]
-        Generator для DataLoader и worker_init_fn.
+        DataLoader generator and worker_init_fn.
     """
     os.environ['PYTHONHASHSEED'] = str(seed_model)
     os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
@@ -80,8 +80,8 @@ def setup_deterministic_training(
 
 
 def setup_environment(cfg):
-    # Не перезаписывать CUDA_VISIBLE_DEVICES, если subprocess уже назначил GPU
-    # (например, worker'ы test_net_optim.py).
+    # Do not overwrite CUDA_VISIBLE_DEVICES when a subprocess already set the GPU
+    # (e.g. test_net_optim.py workers).
     if 'CUDA_VISIBLE_DEVICES' not in os.environ:
         os.environ['CUDA_VISIBLE_DEVICES'] = cfg.GPU
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
